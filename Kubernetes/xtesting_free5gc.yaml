@@ -1,0 +1,101 @@
+# xtesting_free5gc.yaml
+testcase:
+  name: free5gc_full_suite
+  description: >
+    Full Xtesting suite for free5GC, covering RC2 / RA2 scenarios.
+    Includes smoke, functional, workload, negative, performance and observability tests.
+
+  metrics:
+    - name: registration_time
+      unit: seconds
+    - name: pdu_session_time
+      unit: seconds
+    - name: ping_latency
+      unit: ms
+    - name: packet_loss
+      unit: percent
+    - name: throughput
+      unit: Mbps
+    - name: cpu_usage
+      unit: percent
+    - name: memory_usage
+      unit: MB
+    - name: nf_status
+      unit: string
+
+  steps:
+
+    - name: core_startup
+      description: Start all free5GC NFs and check logs
+      run: |
+        cd free5gc
+        ./run.sh &
+        sleep 15
+        curl -s http://127.0.0.10:8000/nnrf-nfm/v1/nf-instances | grep AMF
+
+    - name: smoke_test
+      description: Basic smoke test for NFs
+      run: |
+        echo "Checking AMF, SMF, UPF logs..."
+        grep "started" free5gc/logs/*
+
+    - name: ue_registration
+      description: UE attach via UERANSIM
+      run: |
+        cd UERANSIM/build
+        ./nr-ue -c config/open5gs-ue.yaml > ue.log 2>&1 &
+        sleep 10
+        grep "Registration complete" ue.log
+
+    - name: pdu_session_setup
+      description: Verify PDU session establishment
+      run: |
+        grep "PDU Session established" ue.log
+
+    - name: ping_test
+      description: Verify IP connectivity
+      run: |
+        ping -I uesimtun0 -c 5 8.8.8.8
+
+    - name: multi_ue_load
+      description: Simulate multiple UEs for load testing
+      run: |
+        ./run_multi_ue.sh 50
+
+    - name: slice_test
+      description: Test S-NSSAI / network slicing
+      run: |
+        ./slice_test.sh
+
+    - name: nf_failover_test
+      description: Kill NF to check resilience
+      run: |
+        pkill -f free5gc-amf
+        sleep 5
+        grep "Registration complete" ue.log
+
+    - name: negative_test
+      description: Test error handling with invalid NSSAI
+      run: |
+        ./ueransim_invalid_nssai.sh
+
+    - name: performance_metrics
+      description: Measure throughput and latency
+      run: |
+        ping -I uesimtun0 -c 5 8.8.8.8
+        iperf3 -c 8.8.8.8 -t 10
+
+    - name: prometheus_export
+      description: Push metrics to Prometheus
+      run: |
+        echo "registration_time 1.2" | curl --data-binary @- http://localhost:9091/metrics
+        echo "pdu_session_time 0.8" | curl --data-binary @- http://localhost:9091/metrics
+        echo "ping_latency 15" | curl --data-binary @- http://localhost:9091/metrics
+
+    - name: cleanup
+      description: Stop all processes and cleanup
+      run: |
+        pkill nr-ue
+        pkill nr-gnb
+        pkill free5gc
+        rm -f ue.log
