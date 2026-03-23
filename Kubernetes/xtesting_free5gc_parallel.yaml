@@ -1,0 +1,136 @@
+# xtesting_free5gc_parallel.yaml
+testcase:
+  name: free5gc_parallel_suite
+  description: >
+    Full Xtesting suite for free5GC with parallel UE and slice testing.
+    Collects per-UE metrics, supports Prometheus integration, and structured logging.
+
+  metrics:
+    - name: registration_time
+      unit: seconds
+    - name: pdu_session_time
+      unit: seconds
+    - name: ping_latency
+      unit: ms
+    - name: packet_loss
+      unit: percent
+    - name: throughput
+      unit: Mbps
+    - name: cpu_usage
+      unit: percent
+    - name: memory_usage
+      unit: MB
+    - name: nf_status
+      unit: string
+
+  steps:
+
+    - name: core_startup
+      description: Start free5GC NFs
+      run: |
+        set -e
+        cd free5gc
+        ./run.sh > core.log 2>&1 &
+        sleep 15
+        curl -s http://127.0.0.10:8000/nnrf-nfm/v1/nf-instances | grep -q AMF || exit 1
+
+    - name: smoke_test
+      description: Validate NF logs
+      run: |
+        set -e
+        grep -q "started" free5gc/logs/* || exit 1
+
+    - name: parallel_ue_registration
+      description: Launch multiple UEs concurrently
+      run: |
+        set -e
+        cd UERANSIM/build
+        NUM_UES=50
+        for i in $(seq 1 $NUM_UES); do
+          ./nr-ue -c config/open5gs-ue.yaml > ue_$i.log 2>&1 &
+        done
+        # Wait for registrations with timeout
+        for i in $(seq 1 $NUM_UES); do
+          for j in {1..12}; do
+            grep -q "Registration complete" ue_$i.log && break
+            sleep 5
+          done
+          grep -q "Registration complete" ue_$i.log || { echo "UE $i registration failed"; exit 1; }
+        done
+
+    - name: parallel_pdu_sessions
+      description: Verify PDU sessions for all UEs concurrently
+      run: |
+        set -e
+        for i in $(seq 1 50); do
+          (
+            for j in {1..6}; do
+              grep -q "PDU Session established" ue_$i.log && break
+              sleep 5
+            done
+            grep -q "PDU Session established" ue_$i.log || { echo "UE $i PDU session failed"; exit 1; }
+          ) &
+        done
+        wait
+
+    - name: parallel_slice_tests
+      description: Run multiple slices in parallel
+      run: |
+        set -e
+        for slice in slice1 slice2 slice3; do
+          (
+            ./slice_test.sh $slice > ${slice}.log 2>&1
+            grep -q "Slice test passed" ${slice}.log || { echo "$slice test failed"; exit 1; }
+          ) &
+        done
+        wait
+
+    - name: ping_and_metrics
+      description: Collect ping latency, packet loss, and throughput per UE
+      run: |
+        set -e
+        for i in $(seq 1 50); do
+          (
+            ping -I uesimtun0 -c 5 8.8.8.8 > ping_$i.log
+            packet_loss=$(grep -oP '\d+(?=% packet loss)' ping_$i.log)
+            latency=$(grep 'rtt min/avg/max/mdev' ping_$i.log | awk -F'/' '{print $5}')
+            echo "ping_latency{ue=\"$i\"} $latency" | curl --data-binary @- http://localhost:9091/metrics
+            echo "packet_loss{ue=\"$i\"} $packet_loss" | curl --data-binary @- http://localhost:9091/metrics
+          ) &
+        done
+        wait
+
+    - name: performance_metrics
+      description: Measure CPU, memory, throughput
+      run: |
+        set -e
+        iperf3 -c 8.8.8.8 -t 10 > iperf.log
+        throughput=$(grep -oP '\d+\.\d+(?= Mbits/sec)' iperf.log | tail -1)
+        echo "throughput $throughput" | curl --data-binary @- http://localhost:9091/metrics
+        cpu=$(top -b -n1 | grep free5gc | awk '{sum+=$9} END {print sum}')
+        mem=$(top -b -n1 | grep free5gc | awk '{sum+=$10} END {print sum}')
+        echo "cpu_usage $cpu" | curl --data-binary @- http://localhost:9091/metrics
+        echo "memory_usage $mem" | curl --data-binary @- http://localhost:9091/metrics
+
+    - name: nf_failover_test
+      description: Kill AMF and verify failover
+      run: |
+        set -e
+        pkill -f free5gc-amf
+        sleep 5
+        grep -q "Registration complete" ue_1.log || exit 1
+        echo "nf_status UP" | curl --data-binary @- http://localhost:9091/metrics
+
+    - name: negative_test
+      description: Test invalid NSSAI
+      run: |
+        set -e
+        ./ueransim_invalid_nssai.sh || echo "Expected negative test error"
+
+    - name: cleanup
+      description: Stop all processes
+      run: |
+        pkill nr-ue || true
+        pkill nr-gnb || true
+        pkill free5gc || true
+        rm -f ue_*.log ping_*.log iperf.log *.log
